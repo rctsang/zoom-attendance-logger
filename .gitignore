@@ -1,5 +1,5 @@
 __pycache__/
-server/
 .DS_Store
 venv/
 private/davis_creds.json
+private/creds.json

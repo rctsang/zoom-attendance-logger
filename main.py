@@ -10,15 +10,21 @@ from multiprocessing import Value, Pipe
 from http.server import SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 from base64 import urlsafe_b64encode
+import csv
 
 ### GLOBALS ###
 # !!! Remember to change this here and in Zoom Marketplace if you restarted ngrok server
-REDIRECT_URI = "http://df9015546ab7.ngrok.io"
+REDIRECT_URI = ""
 AUTHORIZE_URL = "https://zoom.us/oauth/authorize"
 ACCESS_TOKEN_URL = "https://zoom.us/oauth/token"
 parent_conn, child_conn = Pipe()
 DIRECTORY = "server"
-CREDS_PATH = "private/davis_creds.json"
+CREDS_PATH = "private/creds.json"
+
+
+#############################################
+############## OAUTH FUNCTIONS ##############
+#############################################
 
 # HTTP request handler class
 class RedirectHandler(SimpleHTTPRequestHandler):
@@ -210,10 +216,132 @@ def get_auth_code(creds):
 	creds['auth_code'] = auth_code
 	write_creds(creds)
 
+#############################################
+############### API WRAPPERS ################
+#############################################
+
+def get_meeting(creds, tokens, meeting_id, occurance_id="", show_prev=True):
+	GET_MEETING_URL = "https://api.zoom.us/v2/meetings/{meetingId}"
+
+	# construct url query dictionary
+	params = {}
+	if occurance_id:
+		params['occurance_id'] = occurance_id
+	if show_prev:
+		params['show_previous_occurances'] = "true"
+	
+
+	# HTTP Request header with valid access token 
+	headers = {'authorization': "Bearer " + tokens['access_token']}
+
+	# GET request for meeting id
+	response = requests.get(
+		GET_MEETING_URL.format(meetingId=meeting_id),
+		headers=headers,
+		params=params
+	)
+
+	# rate limit considerations
+	time.sleep(1)
+	if (response.status_code != 200):
+		print("Get Meeting Failed! Response:")
+		print(response.content, '\n')
+		return {}
+	return response.json()
+
+
+
+def list_meeting_participants(creds, tokens, meeting_id, mtype="live", page_size=100, next_page_token="", include_fields=""):
+	LIST_MEETING_PARTICIPANTS_URL = "https://api.zoom.us/v2/metrics/meetings/{meetingId}/participants"
+
+	# construct url query dictionary
+	params = {}
+	if mtype:
+		params['type'] = mtype
+	if page_size > 30:
+		params['page_size'] = page_size
+	if next_page_token:
+		params['next_page_token'] = next_page_token
+	if include_fields:
+		params['include_fields'] = include_fields
+
+	# HTTP Request header with valid access token 
+	headers = {'authorization': "Bearer " + tokens['access_token']}
+
+	# GET request for meeting participants
+	response = requests.get(
+		LIST_MEETING_PARTICIPANTS_URL.format(meetingId=meeting_id),
+		headers=headers,
+		params=params
+	)
+
+	# rate limit considerations
+	time.sleep(1)
+	if (response.status_code != 200):
+		print("Get Participants Failed! Response:")
+		print(response.content, '\n')
+		return {}
+	return response.json()
+
+
+#############################################
+############### FUNCTIONALITY ###############
+#############################################
+
+# Returns a dictionary of the new attendees in participants
+def compare_against_file(path, participants):
+	with open(path, 'r') as file:
+		reader = csv.DictReader(file)
+		roster = {row['id'] : row for row in reader}
+
+	curr_attendees = set(participants.keys())
+	past_attendees = set(roster.keys())
+	new_attendees = curr_attendees.difference(past_attendees)
+	non_returnees = past_attendees.difference(curr_attendees)
+	returnees = curr_attendees.intersection(past_attendees)
+
+	print("Returnees:")
+	for a in returnees:
+		print('\t', roster[a]['user_name'])
+	print("Non-Returnees:")
+	for a in non_returnees:
+		print('\t', roster[a]['user_name'])
+	print("New Attendees:")
+	for a in new_attendees:
+		print('\t', participants[a]['user_name'])
+
+	return {pid : participants[a] for pid in new_attendees}
+
+def add_new_participants_to_file(path, new_participants):
+	if os.path.exists(path):
+		with open(path, 'r') as file:
+			reader = csv.DictReader(file)
+			roster = {row['id'] : row for row in reader}
+	else:
+		roster = {}
+
+	roster.update(new_participants)
+
+	print("Writing new participants to file...")
+	fieldnames = roster.values()[0].keys()
+	with open(path, 'w') as file:
+		writer = csv.DictWriter(file, fieldnames=fieldnames)
+		writer.writeheader()
+		for p in roster.values():
+			writer.writerow(p)
+
+	print("New participants added:")
+	for p in new_participants.values():
+		print('\t', p['user_name'])
+
 
 
 def main():
 	global CREDS_PATH
+	global REDIRECT_URI
+
+	if not REDIRECT_URI:
+		REDIRECT_URI = input("redirect uri: ")
 	
 	# load client credentials from file
 	with open(CREDS_PATH, 'r') as creds_json:
@@ -232,5 +360,43 @@ def main():
 	get_access_tokens(creds, oauth_tokens)
 	print("Aquired Access Tokens!")
 	print("Access Token:", oauth_tokens['access_token'])
+
+	details = {}
+	participants = {}
+	new_participants = {}
+
+	while (1):
+		print("What Would you like to do? (type \'h\' for options)")
+		cmd = input(": ")
+
+		if cmd == 'h':
+			print("details <meeting id>			- gets details for the meeting id")
+			print("participants <meeting id>	- gets participants for the meeting id")
+			print("allparticipants <meeting id>	- (not implemented")
+			print("compare <file path>			- compares participants against roster .csv file (requires participants first)")
+			print("save <file path> 			- saves new participants to .csv file (requires compare). creates a new file if it doesn't exist")
+
+
+		if "details" in cmd:
+			mid = int(cmd.lstrip("details "))
+			details = get_meeting(creds, oauth_tokens, mid)
+			print(json.dumps(details, indent=2), '\n')
+
+		if "participants" in cmd:
+			mid = int(cmd.lstrip("details "))
+			participants = list_meeting_participants(creds, oauth_tokens, mid)
+			if participants['page_count'] > 1:
+				print("Note: More than 100 participants, please use \'allparticipants\' to list all.")
+			for p in participants:
+				print('\t', participants[p]['user_name'], ': ID', p)
+
+		if "compare" in cmd:
+			path = cmd.lstrip("compare ")
+			new_participants = compare_against_file(path, participants)
+
+		if "save" in cmd:
+			path = cmd.lstrip("save ")
+			add_new_participants_to_file(path, new_participants)
+
 
 main()
